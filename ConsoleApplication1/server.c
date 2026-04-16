@@ -2,11 +2,11 @@
 #include <stdio.h>
 #include <sddl.h>
 #include <locale.h>
-#include <process.h>  // Для _beginthreadex
+#include <process.h>
 
 #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
-#define MAX_CLIENTS 10
 #define BUFFER_SIZE 1024
+#define MAX_CLIENTS 10
 
 // Структура для хранения информации о клиенте
 typedef struct {
@@ -16,79 +16,43 @@ typedef struct {
     HANDLE hThread;
 } CLIENT_INFO;
 
-CLIENT_INFO clients[MAX_CLIENTS];
+CLIENT_INFO* clients[MAX_CLIENTS];  // Массив УКАЗАТЕЛЕЙ на клиентов
 int clientCount = 0;
-CRITICAL_SECTION cs;  // Для синхронизации доступа к общим данным
+CRITICAL_SECTION cs;
 
 // Функция отправки сообщения всем клиентам
 void BroadcastMessage(const char* sender, const char* message, HANDLE excludePipe) {
+    char broadcastMsg[BUFFER_SIZE];
+    snprintf(broadcastMsg, BUFFER_SIZE, "[%s]: %s", sender, message);
+
     EnterCriticalSection(&cs);
     for (int i = 0; i < clientCount; i++) {
-        if (clients[i].hPipe != excludePipe) {
-            char broadcastMsg[BUFFER_SIZE];
-            snprintf(broadcastMsg, BUFFER_SIZE, "[%s]: %s", sender, message);
-
+        if (clients[i] != NULL && clients[i]->hPipe != excludePipe) {
             DWORD bytesWritten;
-            WriteFile(clients[i].hPipe, broadcastMsg, strlen(broadcastMsg) + 1, &bytesWritten, NULL);
+            WriteFile(clients[i]->hPipe, broadcastMsg, strlen(broadcastMsg) + 1, &bytesWritten, NULL);
         }
     }
     LeaveCriticalSection(&cs);
 }
 
-// Функция отправки личного сообщения
-void SendPrivateMessage(const char* targetName, const char* sender, const char* message) {
-    EnterCriticalSection(&cs);
-    for (int i = 0; i < clientCount; i++) {
-        if (strcmp(clients[i].name, targetName) == 0) {
-            char privateMsg[BUFFER_SIZE];
-            snprintf(privateMsg, BUFFER_SIZE, "[ЛС от %s]: %s", sender, message);
-
-            DWORD bytesWritten;
-            WriteFile(clients[i].hPipe, privateMsg, strlen(privateMsg) + 1, &bytesWritten, NULL);
-
-            // Сообщение отправителю, что доставлено
-            snprintf(privateMsg, BUFFER_SIZE, "[Система]: Сообщение для %s доставлено", targetName);
-            WriteFile(clients[sender ? 1 : 0].hPipe, privateMsg, strlen(privateMsg) + 1, &bytesWritten, NULL);
-            break;
-        }
-    }
-    LeaveCriticalSection(&cs);
-}
-
-// Отправить список клиентов
-void SendClientList(HANDLE hPipe) {
-    EnterCriticalSection(&cs);
-    char listMsg[BUFFER_SIZE] = "Подключенные клиенты:\n";
-
-    for (int i = 0; i < clientCount; i++) {
-        strcat(listMsg, "  - ");
-        strcat(listMsg, clients[i].name);
-        strcat(listMsg, "\n");
-    }
-
-    DWORD bytesWritten;
-    WriteFile(hPipe, listMsg, strlen(listMsg) + 1, &bytesWritten, NULL);
-    LeaveCriticalSection(&cs);
-}
-
-// Функция обработки одного клиента
+// Функция обработки клиента
 unsigned int __stdcall ClientThread(void* param) {
     CLIENT_INFO* client = (CLIENT_INFO*)param;
     HANDLE hPipe = client->hPipe;
     char buffer[BUFFER_SIZE];
     DWORD bytesRead;
 
-    // Приветственное сообщение
+    // Приветствие
     char welcome[BUFFER_SIZE];
-    snprintf(welcome, BUFFER_SIZE, "Добро пожаловать, %s!\nКоманды:\n  /list - список клиентов\n  /w имя сообщение - личное сообщение\n  /quit - выход\n", client->name);
+    snprintf(welcome, BUFFER_SIZE, "Добро пожаловать, %s!\n", client->name);
     WriteFile(hPipe, welcome, strlen(welcome) + 1, &bytesRead, NULL);
 
-    // Оповещаем всех о новом клиенте
+    // Оповещаем всех
     char joinMsg[BUFFER_SIZE];
     snprintf(joinMsg, BUFFER_SIZE, "%s подключился к чату", client->name);
     BroadcastMessage("Система", joinMsg, hPipe);
 
-    // Цикл приёма сообщений от клиента
+    // Цикл приёма сообщений
     while (1) {
         memset(buffer, 0, BUFFER_SIZE);
 
@@ -98,36 +62,14 @@ unsigned int __stdcall ClientThread(void* param) {
 
         buffer[bytesRead] = '\0';
 
-        // Обработка команд
-        if (buffer[0] == '/') {
-            if (strcmp(buffer, "/list") == 0 || strcmp(buffer, "/list\n") == 0) {
-                SendClientList(hPipe);
-            }
-            else if (strncmp(buffer, "/w ", 3) == 0) {
-                char targetName[50];
-                char privateMsg[BUFFER_SIZE];
-                if (sscanf(buffer + 3, "%49s %[^\n]", targetName, privateMsg) == 2) {
-                    SendPrivateMessage(targetName, client->name, privateMsg);
-                }
-                else {
-                    const char* errorMsg = "[Система]: Использование: /w имя сообщение\n";
-                    WriteFile(hPipe, errorMsg, strlen(errorMsg) + 1, &bytesRead, NULL);
-                }
-            }
-            else if (strcmp(buffer, "/quit") == 0 || strcmp(buffer, "/quit\n") == 0) {
-                break;
-            }
-        }
-        else {
-            // Обычное сообщение - всем
-            BroadcastMessage(client->name, buffer, hPipe);
-        }
+        // Обычное сообщение
+        BroadcastMessage(client->name, buffer, hPipe);
     }
 
-    // Отключаем клиента
+    // Отключение клиента
     EnterCriticalSection(&cs);
     for (int i = 0; i < clientCount; i++) {
-        if (clients[i].clientId == client->clientId) {
+        if (clients[i] == client) {
             for (int j = i; j < clientCount - 1; j++) {
                 clients[j] = clients[j + 1];
             }
@@ -137,16 +79,17 @@ unsigned int __stdcall ClientThread(void* param) {
     }
     LeaveCriticalSection(&cs);
 
-    // Оповещаем всех об отключении
+    // Оповещаем всех
     char leaveMsg[BUFFER_SIZE];
     snprintf(leaveMsg, BUFFER_SIZE, "%s покинул чат", client->name);
     BroadcastMessage("Система", leaveMsg, NULL);
 
     DisconnectNamedPipe(hPipe);
     CloseHandle(hPipe);
+    free(client);
+
     printf("[Система]: %s отключился. Всего клиентов: %d\n", client->name, clientCount);
 
-    free(client);
     return 0;
 }
 
@@ -179,18 +122,18 @@ int main() {
     sa.bInheritHandle = FALSE;
 
     printf("Многопользовательский чат-сервер запущен\n");
-    printf("Ожидание подключения клиентов...\n");
     printf("=============================================\n");
 
     static DWORD clientIdCounter = 0;
 
     // Основной цикл: принимаем новых клиентов
     while (1) {
+        // ВАЖНО: Убираем FILE_FLAG_FIRST_PIPE_INSTANCE при работе с несколькими клиентами
         hPipe = CreateNamedPipe(
             TEXT(PIPE_NAME),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+            PIPE_ACCESS_DUPLEX,  // Убрали FILE_FLAG_FIRST_PIPE_INSTANCE
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
-            PIPE_UNLIMITED_INSTANCES,  // Неограниченное количество клиентов
+            PIPE_UNLIMITED_INSTANCES,
             BUFFER_SIZE, BUFFER_SIZE,
             0,
             &sa);
@@ -225,7 +168,6 @@ int main() {
         }
 
         clientName[bytesRead] = '\0';
-        // Удаляем символ новой строки если есть
         clientName[strcspn(clientName, "\n")] = 0;
 
         // Создаём структуру клиента
@@ -235,9 +177,9 @@ int main() {
         strncpy(newClient->name, clientName, 49);
         newClient->name[49] = '\0';
 
-        // Добавляем в список
+        // Добавляем в список (как указатель)
         EnterCriticalSection(&cs);
-        clients[clientCount++] = *newClient;
+        clients[clientCount++] = newClient;
         LeaveCriticalSection(&cs);
 
         printf("[Система]: %s подключился. Всего клиентов: %d\n", newClient->name, clientCount);
@@ -247,5 +189,6 @@ int main() {
     }
 
     DeleteCriticalSection(&cs);
+    LocalFree(pSD);
     return 0;
 }
