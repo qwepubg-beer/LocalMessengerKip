@@ -1,7 +1,9 @@
 ﻿#include <windows.h>
 #include <stdio.h>
 
-#define PIPE_NAME "\\\\SERVER-PC\\pipe\\ChatPipe" // Укажите ИМЯ или IP вашего сервера
+//#define PIPE_NAME "\\\\SERVER-PC\\pipe\\ChatPipe"
+#define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
+// Укажите ИМЯ или IP вашего сервера
 // Для теста на одном компьютере используйте:
 // #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
 
