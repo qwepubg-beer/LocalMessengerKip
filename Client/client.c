@@ -1,7 +1,9 @@
 #include <windows.h>
 #include <stdio.h>
 #include <locale.h>
-#define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
+
+#define PIPE_NAME "\\\\.\\pipe\\ChatPipe"   // Для локального теста. Если сервер на другой машине — укажите \\\\имя_компьютера\\pipe\\ChatPipe
+#define BUFFER_SIZE 1024
 
 int main() {
     setlocale(LC_ALL, "Russian");           // Устанавливаем русскую локаль
