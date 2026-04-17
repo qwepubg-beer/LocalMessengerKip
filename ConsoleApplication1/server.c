@@ -2,7 +2,7 @@
 #include <stdio.h>
 #include <sddl.h>  // Добавлено для SDDL
 #include <locale.h>
-#define PIPE_NAME "\\\\10.37.216.74\\pipe\\ChatPipe"
+#define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
 
 int main() {
     HANDLE hPipe;
