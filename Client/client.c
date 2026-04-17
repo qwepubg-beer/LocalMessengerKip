@@ -7,77 +7,62 @@
 #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
 #define BUFFER_SIZE 1024
 
+HANDLE hPipe;
 CRITICAL_SECTION csConsole;
-volatile BOOL g_isConnected = TRUE;
-HANDLE hPipeGlobal = INVALID_HANDLE_VALUE;
+volatile BOOL connected = TRUE;
+HANDLE hReadThread;
 
-// Поток для получения сообщений от сервера
+// Поток для приема сообщений
 DWORD WINAPI ReceiveThread(LPVOID param) {
-    HANDLE hPipe = (HANDLE)param;
     char buffer[BUFFER_SIZE];
     DWORD bytesRead;
 
-    while (g_isConnected) {
+    while (connected) {
         memset(buffer, 0, BUFFER_SIZE);
 
-        if (!ReadFile(hPipe, buffer, sizeof(buffer), &bytesRead, NULL) || bytesRead == 0) {
-            if (g_isConnected) {
+        if (!ReadFile(hPipe, buffer, BUFFER_SIZE, &bytesRead, NULL)) {
+            DWORD error = GetLastError();
+            if (connected && error != ERROR_BROKEN_PIPE) {
                 EnterCriticalSection(&csConsole);
-                printf("\n[Система]: Соединение с сервером потеряно.\n");
-                printf("Нажмите Enter для выхода...\n");
+                printf("\n[Система]: Ошибка чтения: %d\n", error);
+                printf("[Система]: Соединение с сервером потеряно\n");
                 LeaveCriticalSection(&csConsole);
-                g_isConnected = FALSE;
             }
+            connected = FALSE;
             break;
         }
 
-        buffer[bytesRead] = '\0';
-
-        // Вывод полученного сообщения
-        EnterCriticalSection(&csConsole);
-        printf("\r%s\n", buffer);
-        printf("Вы: ");
-        fflush(stdout);
-        LeaveCriticalSection(&csConsole);
+        if (bytesRead > 0) {
+            buffer[bytesRead] = '\0';
+            EnterCriticalSection(&csConsole);
+            printf("\n%s\n", buffer);
+            printf("Вы: ");
+            fflush(stdout);
+            LeaveCriticalSection(&csConsole);
+        }
     }
 
     return 0;
 }
 
-// Функция для отправки сообщения с ожиданием подтверждения
-BOOL SendMessageWithWait(HANDLE hPipe, const char* message, DWORD timeout) {
-    DWORD bytesWritten;
-
-    // Отправляем сообщение
-    if (!WriteFile(hPipe, message, strlen(message) + 1, &bytesWritten, NULL)) {
-        return FALSE;
-    }
-
-    // Ожидаем небольшое время для обработки сервером
-    Sleep(timeout);
-
-    return TRUE;
-}
-
 int main() {
-    HANDLE hPipe;
     char buffer[BUFFER_SIZE];
     char userName[50];
 
-    setlocale(LC_ALL, "Russian");
+    setlocale(LC_ALL, "rus");
     SetConsoleCP(1251);
     SetConsoleOutputCP(1251);
     InitializeCriticalSection(&csConsole);
 
     printf("=====================================\n");
-    printf("        Чат-клиент v2.0\n");
+    printf("       Чат-клиент\n");
     printf("=====================================\n\n");
 
-    // Ввод имени пользователя
+    // Ввод имени
     printf("Введите ваше имя: ");
-    fflush(stdin);
     fgets(userName, sizeof(userName), stdin);
-    userName[strcspn(userName, "\r\n")] = 0;
+    userName[strcspn(userName, "\n")] = 0;
+    userName[strcspn(userName, "\r")] = 0;
 
     if (strlen(userName) == 0) {
         strcpy(userName, "Аноним");
@@ -85,18 +70,24 @@ int main() {
 
     printf("\nПодключение к серверу...\n");
 
-    // Ожидание доступности сервера
+    // Ожидание сервера
     if (!WaitNamedPipe(TEXT(PIPE_NAME), 5000)) {
-        printf("Ошибка: Сервер не отвечает. Убедитесь, что сервер запущен.\n");
-        printf("Код ошибки: %d\n", GetLastError());
+        printf("Ошибка: Сервер не запущен или не отвечает\n");
+        printf("Убедитесь, что сервер запущен и повторите попытку\n");
         DeleteCriticalSection(&csConsole);
         return 1;
     }
 
     // Подключение к серверу
-    hPipe = CreateFile(TEXT(PIPE_NAME),
+    hPipe = CreateFile(
+        TEXT(PIPE_NAME),
         GENERIC_READ | GENERIC_WRITE,
-        0, NULL, OPEN_EXISTING, 0, NULL);
+        0,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         printf("Ошибка подключения к серверу. Код: %d\n", GetLastError());
@@ -104,19 +95,28 @@ int main() {
         return 1;
     }
 
-    // Отправка имени серверу
-    DWORD bytesWritten;
-    if (!WriteFile(hPipe, userName, strlen(userName) + 1, &bytesWritten, NULL)) {
-        printf("Ошибка отправки имени. Код: %d\n", GetLastError());
+    // Переводим канал в режим сообщений
+    DWORD pipeMode = PIPE_READMODE_MESSAGE;
+    if (!SetNamedPipeHandleState(hPipe, &pipeMode, NULL, NULL)) {
+        printf("Ошибка установки режима канала\n");
         CloseHandle(hPipe);
         DeleteCriticalSection(&csConsole);
         return 1;
     }
 
-    // Запуск потока приёма сообщений
-    HANDLE hReadThread = CreateThread(NULL, 0, ReceiveThread, (LPVOID)hPipe, 0, NULL);
+    // Отправляем имя серверу
+    DWORD bytesWritten;
+    if (!WriteFile(hPipe, userName, strlen(userName) + 1, &bytesWritten, NULL)) {
+        printf("Ошибка отправки имени\n");
+        CloseHandle(hPipe);
+        DeleteCriticalSection(&csConsole);
+        return 1;
+    }
+
+    // Запускаем поток приема сообщений
+    hReadThread = CreateThread(NULL, 0, ReceiveThread, NULL, 0, NULL);
     if (hReadThread == NULL) {
-        printf("Ошибка создания потока приёма\n");
+        printf("Ошибка создания потока приема\n");
         CloseHandle(hPipe);
         DeleteCriticalSection(&csConsole);
         return 1;
@@ -125,70 +125,57 @@ int main() {
     printf("\n=====================================\n");
     printf("Добро пожаловать в чат, %s!\n", userName);
     printf("=====================================\n");
-    printf("Команды:\n");
-    printf("  /quit     - выход из чата\n");
-    printf("  /help     - показать эту справку\n");
+    printf("Введите /quit для выхода\n");
     printf("=====================================\n\n");
 
     // Основной цикл отправки сообщений
-    while (g_isConnected) {
+    while (connected) {
         printf("Вы: ");
         fflush(stdout);
 
-        if (!fgets(buffer, sizeof(buffer), stdin)) {
+        if (fgets(buffer, sizeof(buffer), stdin) == NULL) {
             break;
         }
 
-        buffer[strcspn(buffer, "\r\n")] = 0;
+        // Удаляем символ новой строки
+        buffer[strcspn(buffer, "\n")] = 0;
+        buffer[strcspn(buffer, "\r")] = 0;
 
         if (strlen(buffer) == 0) {
             continue;
         }
 
-        // Обработка команд
+        // Проверка на выход
         if (strcmp(buffer, "/quit") == 0) {
-            SendMessageWithWait(hPipe, buffer, 100);
             printf("Выход из чата...\n");
-            g_isConnected = FALSE;
+            // Отправляем команду выхода серверу
+            WriteFile(hPipe, buffer, strlen(buffer) + 1, &bytesWritten, NULL);
+            connected = FALSE;
             break;
         }
 
-        if (strcmp(buffer, "/help") == 0) {
-            printf("\n=== Справка ===\n");
-            printf("/quit - выход из чата\n");
-            printf("/help - показать справку\n");
-            printf("Любое другое сообщение будет отправлено в чат\n");
-            printf("================\n\n");
-            continue;
-        }
-
-        // Отправка сообщения с ожиданием обработки (100 мс)
-        if (!SendMessageWithWait(hPipe, buffer, 100)) {
-            EnterCriticalSection(&csConsole);
-            printf("\n[Ошибка]: Не удалось отправить сообщение. Код: %d\n", GetLastError());
-            printf("Соединение разорвано.\n");
-            LeaveCriticalSection(&csConsole);
-            g_isConnected = FALSE;
+        // Отправляем сообщение серверу
+        if (!WriteFile(hPipe, buffer, strlen(buffer) + 1, &bytesWritten, NULL)) {
+            printf("\n[Ошибка]: Не удалось отправить сообщение\n");
+            connected = FALSE;
             break;
         }
     }
 
-    // Корректное завершение
-    printf("Завершение работы...\n");
-    g_isConnected = FALSE;
-
-    if (hPipe != INVALID_HANDLE_VALUE) {
-        CancelIo(hPipe);  // Прерываем ожидающие операции ввода-вывода
-        CloseHandle(hPipe);
-    }
+    // Завершение работы
+    connected = FALSE;
 
     if (hReadThread != NULL) {
         WaitForSingleObject(hReadThread, 2000);
         CloseHandle(hReadThread);
     }
 
+    if (hPipe != INVALID_HANDLE_VALUE) {
+        CloseHandle(hPipe);
+    }
+
     DeleteCriticalSection(&csConsole);
-    printf("Соединение закрыто. До свидания!\n");
+    printf("Соединение закрыто.\n");
 
     return 0;
 }
