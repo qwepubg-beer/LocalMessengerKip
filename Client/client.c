@@ -4,15 +4,16 @@
 #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
 
 int main() {
+    setlocale(LC_ALL, "Russian");           // Устанавливаем русскую локаль
+    SetConsoleCP(1251);                      // Устанавливаем кодировку ввода (Windows-1251)
+    SetConsoleOutputCP(1251);
+
     HANDLE hPipe;
     char buffer[1024];
     DWORD bytesRead, bytesWritten;
 
     printf("Клиент запущен. Подключение к серверу...\n");
 
-    setlocale(LC_ALL, "Russian");           // Устанавливаем русскую локаль
-    SetConsoleCP(1251);                      // Устанавливаем кодировку ввода (Windows-1251)
-    SetConsoleOutputCP(1251);
     // Проверяем, доступен ли канал
     if (!WaitNamedPipe(TEXT(PIPE_NAME), NMPWAIT_WAIT_FOREVER)) {
         printf("WaitNamedPipe не удался. Убедитесь, что сервер запущен. Ошибка: %d\n", GetLastError());
