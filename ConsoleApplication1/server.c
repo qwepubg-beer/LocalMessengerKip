@@ -2,8 +2,6 @@
 #include <stdio.h>
 #include <sddl.h>
 #include <locale.h>
-#include <fcntl.h> 
-#include <io.h> 
 #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
 #define BUFFER_SIZE 1024
 
@@ -14,7 +12,6 @@ int main() {
     DWORD bytesRead, bytesWritten;
     PSECURITY_DESCRIPTOR pSD = NULL;
     SECURITY_ATTRIBUTES sa;
-    _setmode(_fileno(stdout), _O_U16TEXT);
     setlocale(LC_ALL, "Russian");
     SetConsoleCP(1251);
     SetConsoleOutputCP(1251);
