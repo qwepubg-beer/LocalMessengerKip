@@ -1,28 +1,26 @@
 #include <windows.h>
 #include <stdio.h>
-#include <sddl.h>  // Добавлено для SDDL
+#include <sddl.h>
 #include <locale.h>
+
 #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
+#define BUFFER_SIZE 1024
 
 int main() {
     HANDLE hPipe;
-    char buffer[1024];
+    char buffer[BUFFER_SIZE];
+    char clientName[64] = "Гость";
     DWORD bytesRead, bytesWritten;
     PSECURITY_DESCRIPTOR pSD = NULL;
     SECURITY_ATTRIBUTES sa;
 
-
-    setlocale(LC_ALL, "Russian");           // Устанавливаем русскую локаль
-    SetConsoleCP(1251);                      // Устанавливаем кодировку ввода (Windows-1251)
+    setlocale(LC_ALL, "Russian");
+    SetConsoleCP(1251);
     SetConsoleOutputCP(1251);
-    // Настройка безопасности для доступа без прав администратора
+
     const char* sddlString = "D:(A;;GA;;;AU)";
-    
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
-        sddlString,
-        SDDL_REVISION_1,
-        &pSD,
-        NULL)) {
+        sddlString, SDDL_REVISION_1, &pSD, NULL)) {
         printf("Ошибка создания дескриптора безопасности: %d\n", GetLastError());
         return 1;
     }
@@ -33,17 +31,16 @@ int main() {
 
     printf("Сервер запущен с открытым доступом для всех пользователей...\n");
 
-    // Создание канала с настройками безопасности
     hPipe = CreateNamedPipe(
         TEXT(PIPE_NAME),
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,  // Добавлен флаг
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
         PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
         1,
-        1024, 1024,
+        BUFFER_SIZE, BUFFER_SIZE,
         0,
         &sa);
 
-    LocalFree(pSD);  // Освобождаем память
+    LocalFree(pSD);
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         printf("CreateNamedPipe не удался. Ошибка: %d\n", GetLastError());
@@ -58,27 +55,33 @@ int main() {
         return 1;
     }
 
-    printf("Клиент подключился! Начинаем обмен сообщениями.\n");
+    // Получаем имя клиента
+    if (ReadFile(hPipe, buffer, sizeof(buffer), &bytesRead, NULL) && bytesRead > 0) {
+        buffer[bytesRead] = '\0';
+        strcpy_s(clientName, sizeof(clientName), buffer);
+    }
+
+    printf("Клиент '%s' подключился! Начинаем обмен сообщениями.\n", clientName);
     printf("=============================================\n");
 
-    // Цикл обмена сообщениями (сервер: читает первым, потом отвечает)
     while (1) {
-        // Чтение сообщения от клиента
-        printf("Ожидание сообщения от клиента...\n");
+        printf("Ожидание сообщения от %s...\n", clientName);
         if (!ReadFile(hPipe, buffer, sizeof(buffer), &bytesRead, NULL) || bytesRead == 0) {
             printf("Клиент отключился. Завершение работы сервера.\n");
             break;
         }
         buffer[bytesRead] = '\0';
-        printf("Клиент: %s\n", buffer);
+        printf("%s\n", buffer);
 
-        // Отправка ответа клиенту
-        printf("Вы: ");
+        printf("Сервер: ");
         fgets(buffer, sizeof(buffer), stdin);
         buffer[strcspn(buffer, "\n")] = 0;
 
-        if (!WriteFile(hPipe, buffer, strlen(buffer) + 1, &bytesWritten, NULL)) {
-            printf("Не удалось отправить сообщение клиенту. Ошибка: %d\n", GetLastError());
+        char formatted[BUFFER_SIZE + 64];
+        snprintf(formatted, sizeof(formatted), "Сервер: %s", buffer);
+
+        if (!WriteFile(hPipe, formatted, strlen(formatted) + 1, &bytesWritten, NULL)) {
+            printf("Не удалось отправить сообщение. Ошибка: %d\n", GetLastError());
             break;
         }
     }
