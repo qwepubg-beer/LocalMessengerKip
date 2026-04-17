@@ -1,277 +1,183 @@
 #include <windows.h>
 #include <stdio.h>
-#include <string.h>
 #include <sddl.h>
 #include <locale.h>
-#include <process.h>
-#include <stdlib.h>
+#include <string.h>
 
 #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
-#define BUFFER_SIZE 1024
-#define MAX_CLIENTS 5
-#define MAX_QUEUE_SIZE 100
+#define MAX_CLIENTS 32
+
+CRITICAL_SECTION csClients;
 
 typedef struct {
     HANDLE hPipe;
-    DWORD clientId;
-    char name[50];
-    HANDLE hThread;
-} CLIENT_INFO;
+    char username[64];
+} ClientInfo;
 
-typedef struct {
-    char message[BUFFER_SIZE];
-    CLIENT_INFO* sender;
-} QUEUE_MESSAGE;
+ClientInfo clients[MAX_CLIENTS];
+int numClients = 0;
 
-CLIENT_INFO* clients[MAX_CLIENTS];
-int clientCount = 0;
-CRITICAL_SECTION csClients;
-CRITICAL_SECTION csConsole;
-CRITICAL_SECTION csQueue;
-
-QUEUE_MESSAGE messageQueue[MAX_QUEUE_SIZE];
-int queueFront = 0, queueRear = 0, queueSize = 0;
-HANDLE hQueueEvent;
-HANDLE hBroadcastThread;
-volatile BOOL serverRunning = TRUE;
-
-void EnqueueMessage(const char* message, CLIENT_INFO* sender) {
-    EnterCriticalSection(&csQueue);
-    if (queueSize < MAX_QUEUE_SIZE) {
-        strncpy(messageQueue[queueRear].message, message, BUFFER_SIZE - 1);
-        messageQueue[queueRear].message[BUFFER_SIZE - 1] = '\0';
-        messageQueue[queueRear].sender = sender;
-        queueRear = (queueRear + 1) % MAX_QUEUE_SIZE;
-        queueSize++;
-        SetEvent(hQueueEvent);
-    }
-    LeaveCriticalSection(&csQueue);
-}
-
-BOOL DequeueMessage(QUEUE_MESSAGE* msg) {
-    BOOL result = FALSE;
-    EnterCriticalSection(&csQueue);
-    if (queueSize > 0) {
-        *msg = messageQueue[queueFront];
-        queueFront = (queueFront + 1) % MAX_QUEUE_SIZE;
-        queueSize--;
-        result = TRUE;
-    }
-    LeaveCriticalSection(&csQueue);
-    return result;
-}
-
-void BroadcastMessage(const char* message, CLIENT_INFO* sender) {
+/* Broadcast теперь принимает exceptPipe — чтобы не слать сообщение отправителю */
+void BroadcastMessage(const char* msg, HANDLE exceptPipe) {
     EnterCriticalSection(&csClients);
-    for (int i = 0; i < clientCount; i++) {
-        if (clients[i] != NULL && clients[i] != sender) {
-            DWORD bytesWritten;
-            WriteFile(clients[i]->hPipe, message, strlen(message) + 1, &bytesWritten, NULL);
+    for (int i = 0; i < numClients; i++) {
+        if (exceptPipe != NULL && clients[i].hPipe == exceptPipe) {
+            continue;   /* пропускаем отправителя (он сам напечатает сообщение) */
         }
+        DWORD bytesWritten;
+        WriteFile(clients[i].hPipe, msg, (DWORD)strlen(msg) + 1, &bytesWritten, NULL);
+        /* Ошибки игнорируем — клиент сам отвалится по ReadFile */
     }
     LeaveCriticalSection(&csClients);
 }
 
-unsigned int __stdcall BroadcastThread(void* param) {
-    QUEUE_MESSAGE msg;
-    while (serverRunning) {
-        WaitForSingleObject(hQueueEvent, 100);
-        while (DequeueMessage(&msg)) {
-            BroadcastMessage(msg.message, msg.sender);
-
-            EnterCriticalSection(&csConsole);
-            if (msg.sender) {
-                printf("[%s]: %s\n", msg.sender->name, msg.message + strlen(msg.sender->name) + 2);
-            }
-            else {
-                printf("%s\n", msg.message);
-            }
-            fflush(stdout);
-            LeaveCriticalSection(&csConsole);
-        }
-    }
-    return 0;
-}
-
-unsigned int __stdcall ClientThread(void* param) {
-    CLIENT_INFO* client = (CLIENT_INFO*)param;
-    char buffer[BUFFER_SIZE];
+DWORD WINAPI ClientHandler(LPVOID lpParam) {
+    HANDLE hPipe = (HANDLE)lpParam;
+    char buffer[1024];
     DWORD bytesRead;
+    char username[64] = { 0 };
 
-    // Приветствие
-    char welcome[BUFFER_SIZE];
-    snprintf(welcome, BUFFER_SIZE, "Добро пожаловать в чат, %s!\n", client->name);
-    WriteFile(client->hPipe, welcome, strlen(welcome) + 1, &bytesRead, NULL);
+    /* 1. Читаем имя пользователя (первое сообщение от клиента) */
+    if (!ReadFile(hPipe, buffer, sizeof(buffer), &bytesRead, NULL) || bytesRead == 0) {
+        CloseHandle(hPipe);
+        return 0;
+    }
+    buffer[bytesRead] = '\0';
+    strncpy(username, buffer, 63);
+    username[63] = '\0';
 
-    // Оповещение о входе
-    char joinMsg[BUFFER_SIZE];
-    snprintf(joinMsg, BUFFER_SIZE, "Система: %s подключился к чату", client->name);
-    EnqueueMessage(joinMsg, NULL);
+    /* 2. Добавляем клиента в общий список */
+    EnterCriticalSection(&csClients);
+    if (numClients < MAX_CLIENTS) {
+        clients[numClients].hPipe = hPipe;
+        strcpy(clients[numClients].username, username);
+        numClients++;
+    }
+    LeaveCriticalSection(&csClients);
 
-    while (serverRunning) {
-        memset(buffer, 0, BUFFER_SIZE);
-        if (!ReadFile(client->hPipe, buffer, BUFFER_SIZE, &bytesRead, NULL) || bytesRead == 0) {
+    /* 3. Рассылаем событие «вошёл в чат» ВСЕМ (включая самого пользователя) */
+    char eventMsg[256];
+    sprintf(eventMsg, "Пользователь %s вошел в чат.", username);
+    BroadcastMessage(eventMsg, NULL);
+    printf("%s\n", eventMsg);
+
+    /* 4. Основной цикл — читаем сообщения от клиента */
+    while (1) {
+        if (!ReadFile(hPipe, buffer, sizeof(buffer), &bytesRead, NULL) || bytesRead == 0) {
             break;
         }
         buffer[bytesRead] = '\0';
 
-        if (strcmp(buffer, "/quit") == 0) break;
+        printf("%s: %s\n", username, buffer);
 
-        char formattedMsg[BUFFER_SIZE];
-        snprintf(formattedMsg, BUFFER_SIZE, "%s: %s", client->name, buffer);
-        EnqueueMessage(formattedMsg, client);
-
-        Sleep(10);
+        /* Формируем сообщение для ВСЕХ, КРОМЕ отправителя */
+        char fullMsg[1024 + 70];
+        sprintf(fullMsg, "%s: %s", username, buffer);
+        BroadcastMessage(fullMsg, hPipe);   /* exceptPipe = hPipe отправителя */
     }
 
-    // Удаление клиента
-    char leaveName[50];
-    strncpy(leaveName, client->name, 49); leaveName[49] = '\0';
-
+    /* 5. Клиент отключился — удаляем из списка и уведомляем всех */
     EnterCriticalSection(&csClients);
-    for (int i = 0; i < clientCount; i++) {
-        if (clients[i] == client) {
-            for (int j = i; j < clientCount - 1; j++) clients[j] = clients[j + 1];
-            clientCount--;
+    for (int i = 0; i < numClients; i++) {
+        if (clients[i].hPipe == hPipe) {
+            for (int j = i; j < numClients - 1; j++) {
+                clients[j] = clients[j + 1];
+            }
+            numClients--;
             break;
         }
     }
     LeaveCriticalSection(&csClients);
 
-    char leaveMsg[BUFFER_SIZE];
-    snprintf(leaveMsg, BUFFER_SIZE, "Система: %s покинул чат", leaveName);
-    EnqueueMessage(leaveMsg, NULL);
+    sprintf(eventMsg, "Пользователь %s вышел из чата.", username);
+    BroadcastMessage(eventMsg, NULL);
+    printf("%s\n", eventMsg);
 
-    DisconnectNamedPipe(client->hPipe);
-    CloseHandle(client->hPipe);
-
-    EnterCriticalSection(&csConsole);
-    printf("[Система]: %s отключился. Всего клиентов: %d\n", leaveName, clientCount);
-    fflush(stdout);
-    LeaveCriticalSection(&csConsole);
-
-    free(client);
+    DisconnectNamedPipe(hPipe);
+    CloseHandle(hPipe);
     return 0;
 }
 
 int main() {
-    PSECURITY_DESCRIPTOR pSD = NULL;
-    SECURITY_ATTRIBUTES sa;
-    HANDLE hPipe;
-
     setlocale(LC_ALL, "Russian");
     SetConsoleCP(1251);
     SetConsoleOutputCP(1251);
 
-    InitializeCriticalSection(&csClients);
-    InitializeCriticalSection(&csConsole);
-    InitializeCriticalSection(&csQueue);
-
-    hQueueEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    HANDLE hPipe;
+    PSECURITY_DESCRIPTOR pSD = NULL;
+    SECURITY_ATTRIBUTES sa;
 
     const char* sddlString = "D:(A;;GA;;;AU)";
-    ConvertStringSecurityDescriptorToSecurityDescriptorA(sddlString, SDDL_REVISION_1, &pSD, NULL);
+
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(
+        sddlString, SDDL_REVISION_1, &pSD, NULL)) {
+        printf("Ошибка создания дескриптора безопасности: %d\n", GetLastError());
+        return 1;
+    }
 
     sa.nLength = sizeof(SECURITY_ATTRIBUTES);
     sa.lpSecurityDescriptor = pSD;
     sa.bInheritHandle = FALSE;
 
-    hBroadcastThread = (HANDLE)_beginthreadex(NULL, 0, BroadcastThread, NULL, 0, NULL);
+    InitializeCriticalSection(&csClients);
 
-    printf("=============================================\n");
-    printf("Многопользовательский чат-сервер запущен\n");
-    printf("Максимум клиентов: %d\n", MAX_CLIENTS);
-    printf("=============================================\n\n");
+    printf("Сервер запущен (C, многопользовательский чат)...\n");
 
-    static DWORD clientIdCounter = 0;
+    /* Создаём ПЕРВУЮ инстанцию канала */
+    hPipe = CreateNamedPipe(
+        TEXT(PIPE_NAME),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        1024, 1024,
+        0,
+        &sa);
 
-    while (serverRunning) {
-        if (clientCount >= MAX_CLIENTS) {
-            EnterCriticalSection(&csConsole);
-            printf("[Система]: Достигнут лимит клиентов (%d). Ожидание...\n", MAX_CLIENTS);
-            fflush(stdout);
-            LeaveCriticalSection(&csConsole);
-            Sleep(1000);
-            continue;
+    if (hPipe == INVALID_HANDLE_VALUE) {
+        printf("CreateNamedPipe не удался. Ошибка: %d\n", GetLastError());
+        LocalFree(pSD);
+        DeleteCriticalSection(&csClients);
+        return 1;
+    }
+
+    DWORD dwThreadId;
+
+    while (TRUE) {
+        printf("Ожидание подключения клиента...\n");
+
+        BOOL connected = ConnectNamedPipe(hPipe, NULL);
+        if (!connected && GetLastError() != ERROR_PIPE_CONNECTED) {
+            printf("ConnectNamedPipe не удался. Ошибка: %d\n", GetLastError());
+            break;
         }
 
-        hPipe = CreateNamedPipe(TEXT(PIPE_NAME),
+        printf("Клиент подключился! Создаем поток-обработчик...\n");
+
+        HANDLE hThread = CreateThread(NULL, 0, ClientHandler, hPipe, 0, &dwThreadId);
+        if (hThread == NULL) {
+            printf("Не удалось создать поток: %d\n", GetLastError());
+        }
+        else {
+            CloseHandle(hThread);
+        }
+
+        /* Создаём новую инстанцию канала для следующего клиента */
+        hPipe = CreateNamedPipe(
+            TEXT(PIPE_NAME),
             PIPE_ACCESS_DUPLEX,
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT,
             PIPE_UNLIMITED_INSTANCES,
-            BUFFER_SIZE, BUFFER_SIZE, 0, &sa);
+            1024, 1024,
+            0,
+            &sa);
 
         if (hPipe == INVALID_HANDLE_VALUE) {
-            EnterCriticalSection(&csConsole);
-            printf("[Ошибка]: CreateNamedPipe failed. Код: %d\n", GetLastError());
-            fflush(stdout);
-            LeaveCriticalSection(&csConsole);
-            Sleep(1000);
-            continue;
+            printf("CreateNamedPipe (новая инстанция) не удалась. Ошибка: %d\n", GetLastError());
+            break;
         }
-
-        EnterCriticalSection(&csConsole);
-        printf("[Система]: Ожидание подключения нового клиента...\n");
-        fflush(stdout);
-        LeaveCriticalSection(&csConsole);
-
-        if (!ConnectNamedPipe(hPipe, NULL)) {
-            DWORD err = GetLastError();
-            if (err != ERROR_PIPE_CONNECTED) {
-                CloseHandle(hPipe);
-                continue;
-            }
-        }
-
-        // === ИСПРАВЛЕНО: правильный размер буфера ===
-        char clientName[50] = { 0 };
-        DWORD bytesRead;
-        if (!ReadFile(hPipe, clientName, sizeof(clientName), &bytesRead, NULL) || bytesRead == 0) {
-            EnterCriticalSection(&csConsole);
-            printf("[Ошибка]: Не удалось получить имя клиента\n");
-            fflush(stdout);
-            LeaveCriticalSection(&csConsole);
-            DisconnectNamedPipe(hPipe);
-            CloseHandle(hPipe);
-            continue;
-        }
-        clientName[bytesRead] = '\0';
-        clientName[strcspn(clientName, "\r\n")] = 0;
-
-        CLIENT_INFO* newClient = (CLIENT_INFO*)malloc(sizeof(CLIENT_INFO));
-        if (!newClient) {
-            DisconnectNamedPipe(hPipe);
-            CloseHandle(hPipe);
-            continue;
-        }
-
-        newClient->hPipe = hPipe;
-        newClient->clientId = ++clientIdCounter;
-        strncpy(newClient->name, clientName, 49);
-        newClient->name[49] = '\0';
-
-        EnterCriticalSection(&csClients);
-        clients[clientCount++] = newClient;
-        LeaveCriticalSection(&csClients);
-
-        // === Защищённый вывод ===
-        EnterCriticalSection(&csConsole);
-        printf("[Система]: %s подключился (ID: %d). Всего: %d\n",
-            newClient->name, newClient->clientId, clientCount);
-        fflush(stdout);
-        LeaveCriticalSection(&csConsole);
-
-        newClient->hThread = (HANDLE)_beginthreadex(NULL, 0, ClientThread, newClient, 0, NULL);
     }
 
-    serverRunning = FALSE;
-    WaitForSingleObject(hBroadcastThread, 3000);
-    CloseHandle(hBroadcastThread);
-    CloseHandle(hQueueEvent);
+    LocalFree(pSD);
     DeleteCriticalSection(&csClients);
-    DeleteCriticalSection(&csConsole);
-    DeleteCriticalSection(&csQueue);
-    if (pSD) LocalFree(pSD);
-
     return 0;
 }
