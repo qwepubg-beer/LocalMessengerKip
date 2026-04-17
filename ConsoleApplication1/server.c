@@ -73,7 +73,7 @@ int main() {
         buffer[bytesRead] = '\0';
         printf("%s\n", buffer);
 
-        printf("Сервер: ");
+        printf("Борисс: ");
         fgets(buffer, sizeof(buffer), stdin);
         buffer[strcspn(buffer, "\n")] = 0;
 
