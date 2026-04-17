@@ -78,7 +78,7 @@ int main() {
         buffer[strcspn(buffer, "\n")] = 0;
 
         char formatted[BUFFER_SIZE + 64];
-        snprintf(formatted, sizeof(formatted), "Сервер: %s", buffer);
+        snprintf(formatted, sizeof(formatted), "Борисс: %s", buffer);
 
         if (!WriteFile(hPipe, formatted, strlen(formatted) + 1, &bytesWritten, NULL)) {
             printf("Не удалось отправить сообщение. Ошибка: %d\n", GetLastError());
