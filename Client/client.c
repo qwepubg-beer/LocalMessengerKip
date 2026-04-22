@@ -1,7 +1,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <locale.h>
-#define PIPE_NAME "\\\\.\\pipe\\ChatPipe"  
+#define PIPE_NAME "\\\\KB37-212-MMP\\pipe\\ChatPipe"  
 #define BUFFER_SIZE 1024
 
 int main() {
