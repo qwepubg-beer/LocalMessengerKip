@@ -8,6 +8,7 @@
 
 #define PIPE_NAME "\\\\.\\pipe\\ChatPipe"
 #define BUFFER_SIZE 1024
+#define FILE_BUFFER_SIZE 8192
 #define MAX_CLIENTS 5
 
 typedef struct {
@@ -20,7 +21,82 @@ typedef struct {
 CLIENT_INFO* clients[MAX_CLIENTS];
 int clientCount = 0;
 CRITICAL_SECTION cs;
-HANDLE hMutex;  // Мьютекс для синхронизации
+
+// Функция отправки файла клиенту
+void SendFileToClient(HANDLE hPipe, const char* filename) {
+    char filepath[512];
+    char buffer[FILE_BUFFER_SIZE];
+    DWORD bytesRead, bytesWritten;
+
+    // Формируем путь к файлу в папке "files"
+    snprintf(filepath, sizeof(filepath), "files\\%s", filename);
+
+    // Проверяем существование файла
+    if (GetFileAttributesA(filepath) == INVALID_FILE_ATTRIBUTES) {
+        char errorMsg[BUFFER_SIZE];
+        snprintf(errorMsg, sizeof(errorMsg), "Система: Файл '%s' не найден на сервере", filename);
+        WriteFile(hPipe, errorMsg, strlen(errorMsg) + 1, &bytesWritten, NULL);
+        printf("[Система]: Клиент запросил файл '%s' - файл не найден\n", filename);
+        return;
+    }
+
+    // Открываем файл
+    HANDLE hFile = CreateFileA(
+        filepath,
+        GENERIC_READ,
+        FILE_SHARE_READ,
+        NULL,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        NULL
+    );
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        char errorMsg[BUFFER_SIZE];
+        snprintf(errorMsg, sizeof(errorMsg), "Система: Ошибка открытия файла '%s' (код: %d)", filename, GetLastError());
+        WriteFile(hPipe, errorMsg, strlen(errorMsg) + 1, &bytesWritten, NULL);
+        printf("[Система]: Ошибка открытия файла '%s'\n", filename);
+        return;
+    }
+
+    // Получаем размер файла
+    DWORD fileSize = GetFileSize(hFile, NULL);
+
+    // Отправляем команду начала передачи файла
+    char fileHeader[BUFFER_SIZE];
+    snprintf(fileHeader, sizeof(fileHeader), "FILE_START:%s:%u", filename, fileSize);
+    WriteFile(hPipe, fileHeader, strlen(fileHeader) + 1, &bytesWritten, NULL);
+
+    printf("[Система]: Начинается отправка файла '%s' (размер: %u байт)\n", filename, fileSize);
+
+    // Отправляем файл блоками
+    DWORD totalSent = 0;
+    while (ReadFile(hFile, buffer, FILE_BUFFER_SIZE, &bytesRead, NULL) && bytesRead > 0) {
+        // Отправляем блок с префиксом FILE_DATA
+        char* dataBlock = (char*)malloc(bytesRead + 20);
+        sprintf(dataBlock, "FILE_DATA:");
+        memcpy(dataBlock + 10, buffer, bytesRead);
+
+        if (!WriteFile(hPipe, dataBlock, bytesRead + 10, &bytesWritten, NULL)) {
+            printf("[Система]: Ошибка отправки файла '%s'\n", filename);
+            free(dataBlock);
+            break;
+        }
+
+        totalSent += bytesRead;
+        printf("[Система]: Отправлено %u / %u байт (%.1f%%)\r", totalSent, fileSize, (float)totalSent * 100 / fileSize);
+        free(dataBlock);
+    }
+
+    printf("\n[Система]: Файл '%s' успешно отправлен клиенту\n", filename);
+
+    // Отправляем команду завершения передачи
+    char fileEnd[BUFFER_SIZE];
+    snprintf(fileEnd, sizeof(fileEnd), "FILE_END:%s", filename);
+    WriteFile(hPipe, fileEnd, strlen(fileEnd) + 1, &bytesWritten, NULL);
+
+    CloseHandle(hFile);
+}
 
 // Функция рассылки сообщений всем клиентам
 void BroadcastMessage(const char* message, HANDLE excludePipe) {
@@ -48,6 +124,11 @@ unsigned int __stdcall ClientThread(void* param) {
     char welcome[BUFFER_SIZE];
     snprintf(welcome, BUFFER_SIZE, "Добро пожаловать в чат, %s!\n", client->name);
     WriteFile(hPipe, welcome, strlen(welcome) + 1, &bytesRead, NULL);
+
+    // Отправляем список доступных файлов
+    char fileListMsg[BUFFER_SIZE];
+    snprintf(fileListMsg, BUFFER_SIZE, "Система: Доступные команды: /quit - выход, takefile(имя_файла) - скачать файл");
+    WriteFile(hPipe, fileListMsg, strlen(fileListMsg) + 1, &bytesRead, NULL);
 
     // Оповещаем всех о входе нового пользователя
     char joinMsg[BUFFER_SIZE];
@@ -79,6 +160,27 @@ unsigned int __stdcall ClientThread(void* param) {
         if (strcmp(buffer, "/quit") == 0) {
             printf("[%s]: Пользователь вышел из чата\n", client->name);
             break;
+        }
+
+        // Проверка на команду takefile
+        if (strncmp(buffer, "takefile(", 9) == 0) {
+            // Извлекаем имя файла
+            char filename[256];
+            int i, j = 0;
+            for (i = 9; buffer[i] != '\0' && buffer[i] != ')' && j < 255; i++) {
+                filename[j++] = buffer[i];
+            }
+            filename[j] = '\0';
+
+            if (strlen(filename) > 0) {
+                printf("[%s]: Запросил файл '%s'\n", client->name, filename);
+                SendFileToClient(hPipe, filename);
+            }
+            else {
+                char errorMsg[] = "Система: Неверный формат команды. Используйте: takefile(имя_файла)";
+                WriteFile(hPipe, errorMsg, strlen(errorMsg) + 1, &bytesRead, NULL);
+            }
+            continue;
         }
 
         // Отправляем сообщение всем (включая отправителя для подтверждения)
@@ -154,6 +256,9 @@ int main() {
     SetConsoleCP(1251);
     SetConsoleOutputCP(1251);
 
+    // Создаем папку для файлов если её нет
+    CreateDirectoryA("files", NULL);
+
     InitializeCriticalSection(&cs);
 
     // Настройка безопасности для Windows
@@ -170,6 +275,7 @@ int main() {
 
     printf("=============================================\n");
     printf("Чат-сервер запущен (макс. %d клиентов)\n", MAX_CLIENTS);
+    printf("Файлы для скачивания должны быть в папке 'files/'\n");
     printf("=============================================\n\n");
 
     DWORD clientIdCounter = 0;
