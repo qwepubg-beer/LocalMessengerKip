@@ -15,12 +15,12 @@ typedef struct {
     DWORD clientId;
     char name[50];
     HANDLE hThread;
-    BOOL sendingFile;   // флаг: идёт передача файла этому клиенту
 } CLIENT_INFO;
 
 CLIENT_INFO* clients[MAX_CLIENTS];
 int clientCount = 0;
 CRITICAL_SECTION cs;
+HANDLE hMutex;  // Мьютекс для синхронизации
 
 // Функция рассылки сообщений всем клиентам
 void BroadcastMessage(const char* message, HANDLE excludePipe) {
@@ -28,10 +28,6 @@ void BroadcastMessage(const char* message, HANDLE excludePipe) {
 
     for (int i = 0; i < clientCount; i++) {
         if (clients[i] != NULL && clients[i]->hPipe != excludePipe) {
-            // Не отправляем, если клиент занят приёмом файла
-            if (clients[i]->sendingFile) {
-                continue;
-            }
             DWORD bytesWritten;
             WriteFile(clients[i]->hPipe, message, strlen(message) + 1, &bytesWritten, NULL);
         }
@@ -85,71 +81,7 @@ unsigned int __stdcall ClientThread(void* param) {
             break;
         }
 
-        // Проверка команды takefile
-        if (strncmp(buffer, "takefile ", 9) == 0) {
-            char* filepath = buffer + 9;
-            while (*filepath == ' ') filepath++;  // пропуск начальных пробелов
-            if (filepath[0] == '\0') {
-                char* err = "FILE_ERROR:Путь к файлу не указан";
-                WriteFile(hPipe, err, strlen(err) + 1, &bytesRead, NULL);
-            }
-            else {
-                FILE* fp = fopen(filepath, "rb");
-                if (fp == NULL) {
-                    char errMsg[BUFFER_SIZE];
-                    snprintf(errMsg, BUFFER_SIZE, "FILE_ERROR:Не удалось открыть файл %s", filepath);
-                    WriteFile(hPipe, errMsg, strlen(errMsg) + 1, &bytesRead, NULL);
-                }
-                else {
-                    // Входим в режим передачи файла
-                    EnterCriticalSection(&cs);
-                    client->sendingFile = TRUE;
-                    LeaveCriticalSection(&cs);
-
-                    // Определяем размер и имя файла
-                    fseek(fp, 0, SEEK_END);
-                    long fileSize = ftell(fp);
-                    fseek(fp, 0, SEEK_SET);
-                    const char* filename = strrchr(filepath, '\\');
-                    if (filename != NULL) filename++;
-                    else filename = filepath;
-
-                    // Отправляем заголовок
-                    char startMsg[BUFFER_SIZE];
-                    snprintf(startMsg, BUFFER_SIZE, "FILE_START:%s:%ld", filename, fileSize);
-                    if (!WriteFile(hPipe, startMsg, strlen(startMsg) + 1, &bytesRead, NULL)) {
-                        fclose(fp);
-                        EnterCriticalSection(&cs);
-                        client->sendingFile = FALSE;
-                        LeaveCriticalSection(&cs);
-                        break;  // разрыв соединения
-                    }
-
-                    // Отправляем данные кусками
-                    char dataBuffer[BUFFER_SIZE];
-                    size_t bytes;
-                    while ((bytes = fread(dataBuffer, 1, BUFFER_SIZE - 1, fp)) > 0) {
-                        if (!WriteFile(hPipe, dataBuffer, bytes, &bytesRead, NULL)) {
-                            break;
-                        }
-                    }
-                    fclose(fp);
-
-                    // Завершаем передачу
-                    WriteFile(hPipe, "FILE_END", 8 + 1, &bytesRead, NULL); // "FILE_END\0"
-
-                    // Выходим из режима передачи
-                    EnterCriticalSection(&cs);
-                    client->sendingFile = FALSE;
-                    LeaveCriticalSection(&cs);
-
-                    printf("[Файл]: %s отправлен клиенту %s\n", filename, client->name);
-                }
-            }
-            continue;  // возвращаемся к приёму следующих сообщений
-        }
-
-        // Обычное сообщение чата
+        // Отправляем сообщение всем (включая отправителя для подтверждения)
         if (strlen(buffer) > 0) {
             char formattedMsg[BUFFER_SIZE];
             snprintf(formattedMsg, BUFFER_SIZE, "%s: %s", client->name, buffer);
@@ -159,8 +91,6 @@ unsigned int __stdcall ClientThread(void* param) {
             EnterCriticalSection(&cs);
             for (int i = 0; i < clientCount; i++) {
                 if (clients[i] != NULL) {
-                    // Проверка на режим передачи файла (пропускаем занятых)
-                    if (clients[i]->sendingFile) continue;
                     DWORD bytesWritten;
                     WriteFile(clients[i]->hPipe, formattedMsg, strlen(formattedMsg) + 1, &bytesWritten, NULL);
                 }
@@ -191,13 +121,13 @@ unsigned int __stdcall ClientThread(void* param) {
     }
     LeaveCriticalSection(&cs);
 
-    // Оповещаем всех о выходе (только не занятых передачей)
+    // Оповещаем всех о выходе
     char leaveMsg[BUFFER_SIZE];
     snprintf(leaveMsg, BUFFER_SIZE, "Система: %s покинул чат", leaveName);
 
     EnterCriticalSection(&cs);
     for (int i = 0; i < clientCount; i++) {
-        if (clients[i] != NULL && !clients[i]->sendingFile) {
+        if (clients[i] != NULL) {
             DWORD bytesWritten;
             WriteFile(clients[i]->hPipe, leaveMsg, strlen(leaveMsg) + 1, &bytesWritten, NULL);
         }
@@ -296,6 +226,7 @@ int main() {
         }
 
         clientName[bytesRead] = '\0';
+        // Удаляем символы новой строки
         clientName[strcspn(clientName, "\r\n")] = 0;
 
         if (strlen(clientName) == 0) {
@@ -307,7 +238,6 @@ int main() {
         newClient->hPipe = hPipe;
         newClient->clientId = ++clientIdCounter;
         strcpy(newClient->name, clientName);
-        newClient->sendingFile = FALSE;   // инициализация флага
 
         // Добавление в список клиентов
         EnterCriticalSection(&cs);
